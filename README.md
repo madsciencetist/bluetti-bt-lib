@@ -48,6 +48,7 @@ Added and mostly validated by contributors (some are moved here from the HA Inte
 |EP500P     |bluetti-mqtt                                                                       |✅                   |✅            |✅            |✅             |✅             |
 |EP760      |[@Apfuntimes](https://github.com/Apfuntimes)                                       |✅                   |PV            |Grid          |❌             |AC Phases      |
 |EP800      |[@jhagenk](https://github.com/jhagenk)                                             |✅                   |❌            |❌            |❌             |❌             |
+|FP         |[@madsciencetist](https://github.com/madsciencetist)                               |✅                   |❌            |✅            |✅             |✅             |
 |PR30V2     |@gentoo90                                                                          |✅                   |✅            |✅            |✅             |✅             |
 
 ## Controls
@@ -62,6 +63,7 @@ Added and mostly validated by contributors:
 |Device Name|Contributor                                              |ctrl_ac|ctrl_dc|ctrl_ups_mode|soc_range_start|soc_range_end|
 |-----------|---------------------------------------------------------|-------|-------|-------------|---------------|-------------|
 |AC200L     |bluetti-mqtt, [@seaburger](https://github.com/seaburger) |✅     |✅     |✅           |❌             |❌           |
+|FP         |[@madsciencetist](https://github.com/madsciencetist)     |✅     |✅     |❌           |❌             |❌           |
 
 ## Battery pack data
 
