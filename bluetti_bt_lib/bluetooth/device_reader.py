@@ -75,7 +75,7 @@ class DeviceReader:
                         self.device = None
                     else:
                         self.device = await BleakScanner.find_device_by_address(
-                            self.mac, timeout=5
+                            self.mac, timeout=15
                         )
 
                         if self.device is None:
@@ -101,6 +101,9 @@ class DeviceReader:
                             NOTIFY_UUID, self._notification_handler
                         )
                         self.has_notifier = True
+                        # Drain any unsolicited notifications the device pushes on connect
+                        await asyncio.sleep(0.5)
+                        self.notify_response = bytearray()
 
                     self.logger.debug("Notification handler setup complete")
 
@@ -112,9 +115,9 @@ class DeviceReader:
                         self.logger.debug("Encryption handshake not finished yet")
 
                     for register in registers:
-                        body = register.parse_response(
-                            await self._async_send_command(register)
-                        )
+                        raw_response = await self._async_send_command(register)
+                        self.logger.debug("Raw response bytes: %s", raw_response.hex())
+                        body = register.parse_response(raw_response)
 
                         self.logger.debug("Raw data: %s", body)
 
@@ -254,7 +257,11 @@ class DeviceReader:
                 )
 
             key, iv = self.encryption.getKeyIv()
-            decrypted = Message(self.encryption.aes_decrypt(message.buffer, key, iv))
+            try:
+                decrypted = Message(self.encryption.aes_decrypt(message.buffer, key, iv))
+            except ValueError:
+                self.logger.debug("Dropping non-aligned notification (unsolicited push)")
+                return
 
             if decrypted.is_pre_key_exchange:
                 decrypted.verify_checksum()
@@ -272,9 +279,23 @@ class DeviceReader:
             data = decrypted.buffer
 
         # Save data
+        self.logger.debug("Notification bytes: %s (accumulated: %d)", bytes(data).hex(), len(self.notify_response) + len(data))
         self.notify_response.extend(data)
 
-        if self.notify_future is None:
+        if self.notify_future is None or self.notify_future.done():
             return
 
-        self.notify_future.set_result(self.notify_response)
+        # Only resolve when we have a complete, valid Modbus response.
+        # Handles unsolicited notifications and fragmented responses.
+        if self.current_registers is not None:
+            if self.current_registers.is_valid_response(self.notify_response):
+                self.notify_future.set_result(bytes(self.notify_response))
+            elif len(self.notify_response) >= self.current_registers.response_size():
+                # Buffer is big enough but CRC fails — accumulated noise corrupted it.
+                # Discard old bytes and try just this notification alone.
+                if self.current_registers.is_valid_response(bytearray(data)):
+                    self.notify_future.set_result(bytes(data))
+                else:
+                    self.notify_response = bytearray(data)
+        else:
+            self.notify_future.set_result(self.notify_response)
