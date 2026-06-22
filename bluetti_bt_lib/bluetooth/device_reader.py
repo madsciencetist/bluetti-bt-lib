@@ -6,6 +6,8 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
+from cryptography.exceptions import InvalidSignature
+
 from .encryption import BluettiEncryption, Message, MessageType
 from ..base_devices import BluettiDevice
 from ..const import NOTIFY_UUID, WRITE_UUID
@@ -189,9 +191,7 @@ class DeviceReader:
                 if self.client:
                     await self.client.disconnect()
                     self.logger.debug("Disconnected from device")
-
-            # Reset Encryption keys
-            self.encryption.reset()
+                self.encryption.reset()
 
             # Check if dict is empty
             if not parsed_data:
@@ -267,7 +267,21 @@ class DeviceReader:
                 decrypted.verify_checksum()
 
                 if decrypted.type == MessageType.PEER_PUBKEY:
-                    peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    try:
+                        peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    except InvalidSignature:
+                        # HA's BT stack can replay a stale CHALLENGE from a prior
+                        # connection; if we responded to that before the live one
+                        # the device's PEER_PUBKEY was signed against a different IV.
+                        # Reset unsecure state so the next spontaneous CHALLENGE
+                        # from the device starts a clean handshake.
+                        self.logger.warning(
+                            "PEER_PUBKEY signature invalid; likely stale cached "
+                            "challenge notification. Resetting handshake state."
+                        )
+                        self.encryption.unsecure_aes_key = None
+                        self.encryption.unsecure_aes_iv = None
+                        return
                     await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
