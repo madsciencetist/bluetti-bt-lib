@@ -6,6 +6,8 @@ from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from bleak_retry_connector import BleakClientWithServiceCache, establish_connection
 
+from cryptography.exceptions import InvalidSignature
+
 from .encryption import BluettiEncryption, Message, MessageType, AES_BLOCK_SIZE
 from ..base_devices import BluettiDevice
 from ..const import NOTIFY_UUID, WRITE_UUID
@@ -51,6 +53,7 @@ class DeviceReader:
         self.notify_future: asyncio.Future[Any] | None = None
         self.encryption = BluettiEncryption()
         self.encrypted_buffer = bytearray()
+        self._handshake_event: asyncio.Event | None = None
 
     async def read(
         self, only_registers: List[ReadableRegisters] | None = None, raw: bool = False
@@ -70,24 +73,23 @@ class DeviceReader:
         async with self.polling_lock:
             try:
                 async with async_timeout.timeout(self.config.timeout):
-                    self.logger.debug("Searching for device")
-
-                    if self.ble_client:
-                        self.device = None
-                    else:
-                        self.device = await BleakScanner.find_device_by_address(
-                            self.mac, timeout=5
-                        )
-
-                        if self.device is None:
-                            self.logger.error("Device not found")
-                            return
-
-                    self.logger.debug("Connecting to device")
+                    needs_connect = (
+                        self.client is None
+                        or (self.ble_client is None and not self.client.is_connected)
+                    )
 
                     if self.ble_client:
                         self.client = self.ble_client
-                    else:
+                    elif needs_connect:
+                        self.logger.debug("Searching for device")
+                        self.device = await BleakScanner.find_device_by_address(
+                            self.mac, timeout=15
+                        )
+                        if self.device is None:
+                            self.logger.error("Device not found")
+                            return None
+
+                        self.logger.debug("Connecting to device")
                         self.client = await establish_connection(
                             BleakClientWithServiceCache,
                             self.device,
@@ -98,24 +100,30 @@ class DeviceReader:
                     self.logger.debug("Connected to device")
 
                     if not self.has_notifier:
+                        self._handshake_event = asyncio.Event()
                         await self.client.start_notify(
                             NOTIFY_UUID, self._notification_handler
                         )
                         self.has_notifier = True
+                        # Drain any unsolicited notifications the device pushes on connect
+                        await asyncio.sleep(0.5)
+                        self.notify_response = bytearray()
 
                     self.logger.debug("Notification handler setup complete")
 
-                    while (
-                        self.config.use_encryption
-                        and not self.encryption.is_ready_for_commands
-                    ):
-                        await asyncio.sleep(5)
-                        self.logger.debug("Encryption handshake not finished yet")
+                    if self.config.use_encryption and not self.encryption.is_ready_for_commands:
+                        self.logger.debug("Waiting for encryption handshake")
+                        try:
+                            await asyncio.wait_for(
+                                self._handshake_event.wait(), timeout=12
+                            )
+                        except asyncio.TimeoutError:
+                            raise TimeoutError("Encryption handshake timed out")
 
                     for register in registers:
-                        body = register.parse_response(
-                            await self._async_send_command(register)
-                        )
+                        raw_response = await self._async_send_command(register)
+                        self.logger.debug("Raw response bytes: %s", raw_response.hex())
+                        body = register.parse_response(raw_response)
 
                         self.logger.debug("Raw data: %s", body)
 
@@ -176,21 +184,7 @@ class DeviceReader:
                 self.logger.warning("Unknown error %s", err)
                 return None
             finally:
-                if self.has_notifier:
-                    try:
-                        await self.client.stop_notify(NOTIFY_UUID)
-                        self.logger.debug("Stopped notifier")
-                    except:
-                        # Ignore errors here
-                        pass
-                    self.has_notifier = False
-                if self.client:
-                    await self.client.disconnect()
-                    self.logger.debug("Disconnected from device")
-
-            # Reset Encryption keys
-            self.encryption.reset()
-            self.encrypted_buffer.clear()
+                await self._teardown()
 
             # Check if dict is empty
             if not parsed_data:
@@ -248,6 +242,23 @@ class DeviceReader:
         padded_len = ((data_len + AES_BLOCK_SIZE - 1) // AES_BLOCK_SIZE) * AES_BLOCK_SIZE
 
         return header_size + padded_len
+
+    async def _teardown(self) -> None:
+        if self.has_notifier:
+            try:
+                await self.client.stop_notify(NOTIFY_UUID)
+                self.logger.debug("Stopped notifier")
+            except Exception:
+                pass
+            self.has_notifier = False
+        if self.client:
+            try:
+                await self.client.disconnect()
+                self.logger.debug("Disconnected from device")
+            except Exception:
+                pass
+        self.encryption.reset()
+        self.encrypted_buffer.clear()
 
     async def _notification_handler(self, _: int, data: bytearray):
         """Handle bt data."""
@@ -311,21 +322,51 @@ class DeviceReader:
                 decrypted.verify_checksum()
 
                 if decrypted.type == MessageType.PEER_PUBKEY:
-                    peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    try:
+                        peer_pubkey_response = self.encryption.msg_peer_pubkey(decrypted)
+                    except InvalidSignature:
+                        # HA's BT stack can replay a stale CHALLENGE from a prior
+                        # connection; if we responded to that before the live one
+                        # the device's PEER_PUBKEY was signed against a different IV.
+                        # Reset unsecure state so the next spontaneous CHALLENGE
+                        # from the device starts a clean handshake.
+                        self.logger.warning(
+                            "PEER_PUBKEY signature invalid; likely stale cached "
+                            "challenge notification. Resetting handshake state."
+                        )
+                        self.encryption.unsecure_aes_key = None
+                        self.encryption.unsecure_aes_iv = None
+                        return
                     await self.client.write_gatt_char(WRITE_UUID, peer_pubkey_response)
                     return
 
                 if decrypted.type == MessageType.PUBKEY_ACCEPTED:
                     self.encryption.msg_key_accepted(decrypted)
+                    if self._handshake_event is not None:
+                        self._handshake_event.set()
                     return
 
             # Handle as message
             data = decrypted.buffer
 
         # Save data
+        self.logger.debug("Notification bytes: %s (accumulated: %d)", bytes(data).hex(), len(self.notify_response) + len(data))
         self.notify_response.extend(data)
 
-        if self.notify_future is None:
+        if self.notify_future is None or self.notify_future.done():
             return
 
-        self.notify_future.set_result(self.notify_response)
+        # Only resolve when we have a complete, valid Modbus response.
+        # Handles unsolicited notifications and fragmented responses.
+        if self.current_registers is not None:
+            if self.current_registers.is_valid_response(self.notify_response):
+                self.notify_future.set_result(bytes(self.notify_response))
+            elif len(self.notify_response) >= self.current_registers.response_size():
+                # Buffer is big enough but CRC fails — accumulated noise corrupted it.
+                # Discard old bytes and try just this notification alone.
+                if self.current_registers.is_valid_response(bytearray(data)):
+                    self.notify_future.set_result(bytes(data))
+                else:
+                    self.notify_response = bytearray(data)
+        else:
+            self.notify_future.set_result(self.notify_response)
